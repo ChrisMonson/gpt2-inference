@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Model weights (download from Hugging Face; see README)
+gpt2/
+*.safetensors
+
+# macOS
+.DS_Store
