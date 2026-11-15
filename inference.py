@@ -11,7 +11,7 @@ class inference:
     model_dimension:int
     model_layers:int
     model_heads:int
-    layer_normal_epsilon:float
+    layer_norm_epsilon:float
     residual_stream: ndarray
     context_window:int
     temperature = 0.7
@@ -31,7 +31,7 @@ class inference:
             self.model_layers = config["n_layer"]
             self.model_heads = config["n_head"]
             self.context_window = config["n_ctx"]
-            self.layer_normal_epsilon = config["layer_norm_epsilon"]
+            self.layer_norm_epsilon = config["layer_norm_epsilon"]
 
         self.reset()
 
@@ -78,16 +78,16 @@ class inference:
 
         #next token scoring
         last_token = normalized[-1,:]
-        weighted_tokens = np.zeros(len(token_embeddings))
+        logits = np.zeros(len(token_embeddings))
 
-        for i in range(len(weighted_tokens)):
-            weighted_tokens[i] = np.dot(token_embeddings[i], last_token)
+        for i in range(len(logits)):
+            logits[i] = np.dot(token_embeddings[i], last_token)
 
-        softmaxed_tokens = self.softmax(weighted_tokens, self.temperature)
+        probabilities = self.softmax(logits, self.temperature)
 
         #sampling
-        top_ids = np.argsort(softmaxed_tokens)[-10:][::-1]   # 10 highest, descending
-        top_probabilities = softmaxed_tokens[top_ids]
+        top_ids = np.argsort(probabilities)[-10:][::-1]   # 10 highest, descending
+        top_probabilities = probabilities[top_ids]
         top_probabilities = top_probabilities / top_probabilities.sum()
         next_id = int(np.random.choice(top_ids, p=top_probabilities))
             
@@ -102,8 +102,8 @@ class inference:
         normalized_stream = self.normalize(self.residual_stream, pre_attention_normalization_weights, pre_attention_normalization_bias)
 
         #attention (query, key, value calculations)
-        attention_weights = self.w["h." + str(layer) + ".attn.c_attn.weight"]
-        attention_bias = self.w["h." + str(layer) + ".attn.c_attn.bias"]
+        qkv_weights = self.w["h." + str(layer) + ".attn.c_attn.weight"]
+        qkv_bias = self.w["h." + str(layer) + ".attn.c_attn.bias"]
 
         stream_length = len(self.residual_stream)
         q = np.zeros((stream_length, self.model_dimension), dtype=np.float32)
@@ -112,14 +112,14 @@ class inference:
 
         #QKV comes as a combined vector. In GPT2 this means 12 heads with 64 values for each Q,K, and V (2304 total)
         for t in range(stream_length):
-            out = np.zeros(self.model_dimension * 3, dtype=np.float32)
+            qkv = np.zeros(self.model_dimension * 3, dtype=np.float32)
             for j in range(self.model_dimension * 3):
-                out[j] = np.dot(normalized_stream[t], attention_weights[:, j])   # one dot product per column
-            out += attention_bias
+                qkv[j] = np.dot(normalized_stream[t], qkv_weights[:, j])   # one dot product per column
+            qkv += qkv_bias
 
-            q[t] = out[0:self.model_dimension]
-            k[t] = out[self.model_dimension:(self.model_dimension * 2)]
-            v[t] = out[self.model_dimension * 2:(self.model_dimension * 3)]
+            q[t] = qkv[0:self.model_dimension]
+            k[t] = qkv[self.model_dimension:(self.model_dimension * 2)]
+            v[t] = qkv[self.model_dimension * 2:(self.model_dimension * 3)]
 
         #add the new values to the KV Cache so we don't have to recalculate
         self.cache_k[layer] = np.concatenate((self.cache_k[layer], k))
@@ -148,12 +148,12 @@ class inference:
             row = x[t]
             mean = sum(x[t]) / self.model_dimension
 
-            total_variance = 0
+            sum_sq_diff = 0
             for v in range(self.model_dimension):
-                total_variance += (x[t][v] - mean) ** 2
+                sum_sq_diff += (x[t][v] - mean) ** 2
 
-            var = total_variance / self.model_dimension
-            std = np.sqrt(var + self.layer_normal_epsilon)
+            var = sum_sq_diff / self.model_dimension
+            std = np.sqrt(var + self.layer_norm_epsilon)
 
             for d in range(self.model_dimension):
                 out[t, d] = (row[d] - mean) / std * gamma[d] + beta[d]
@@ -167,7 +167,7 @@ class inference:
         score_scalar = math.sqrt(head_size)
 
         #at this point q,k,v are arrays of 768 for all tokens [tokens,768]. 768 is 64 values for each of the 12 heads
-        #calculate the q,k, and v for each head
+        #split q, k, v into per-head slices
         for i in range(self.model_heads):
             head_start = i * head_size
             head_q = q[:, head_start:head_start + head_size]
@@ -187,7 +187,7 @@ class inference:
 
                 weighted_sum = np.zeros(head_size, dtype=np.float32)
 
-                #calculate the weighted sum by multiplying the head value vectors by the weighted scores
+                #calculate the weighted sum by multiplying the head value vectors by the attention weights
                 for hv in range(head_size):
                     for x in range(len(scores)):
                         weighted_sum[hv] += head_v[x][hv] * weights[x]
@@ -200,16 +200,16 @@ class inference:
     def compute_mlp(self, layer:int) -> ndarray:
         normalization_weight = self.w[f"h.{layer}.ln_2.weight"]
         normalization_bias = self.w[f"h.{layer}.ln_2.bias"]
-        feed_forward_weight = self.w[f"h.{layer}.mlp.c_fc.weight"]
-        feed_forward_bias = self.w[f"h.{layer}.mlp.c_fc.bias"]
-        projection_weight = self.w[f"h.{layer}.mlp.c_proj.weight"]
-        projection_bias = self.w[f"h.{layer}.mlp.c_proj.bias"]
+        up_project_weight = self.w[f"h.{layer}.mlp.c_fc.weight"]
+        up_project_bias = self.w[f"h.{layer}.mlp.c_fc.bias"]
+        down_project_weight = self.w[f"h.{layer}.mlp.c_proj.weight"]
+        down_project_bias = self.w[f"h.{layer}.mlp.c_proj.bias"]
 
         normalized = self.normalize(self.residual_stream, normalization_weight, normalization_bias)
 
-        hidden = normalized @ feed_forward_weight + feed_forward_bias
+        hidden = normalized @ up_project_weight + up_project_bias
         hidden = self.gelu(hidden)
-        mlp_out = hidden @ projection_weight + projection_bias
+        mlp_out = hidden @ down_project_weight + down_project_bias
 
         return mlp_out
 
@@ -224,7 +224,7 @@ class inference:
 
     
 infer = inference("gpt2") 
-enc = tiktoken.get_encoding(infer.model_type)
+enc = tiktoken.get_encoding("gpt2")
 
 text = input()
 
