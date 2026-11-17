@@ -16,13 +16,13 @@ class Inference:
     residual_stream: ndarray
     context_window: int
     temperature: float
-    cache_k: list[ndarray]
-    cache_v: list[ndarray]
+    cache: ndarray
     cache_len: int
     w: dict[str, ndarray]
 
     def __init__(self, model: str):
         self.w = load_file(f"{model}/model.safetensors")
+        self.temperature = 0.7
 
         # Pull in model specific config settings
         with open(f"{model}/config.json") as file:
@@ -33,17 +33,15 @@ class Inference:
             self.model_heads = config["n_head"]
             self.context_window = config["n_ctx"]
             self.layer_norm_epsilon = config["layer_norm_epsilon"]
-            self.temperature = 0.7
 
         self.reset()
 
     # reset the KV Cache either to set up a new instantiation, or to reset for a new prompt
     def reset(self):
-        self.cache_k = list()
-        self.cache_v = list()
-        for _ in range(self.model_layers):
-            self.cache_k.append(np.zeros((0, self.model_dimension), dtype=np.float32))
-            self.cache_v.append(np.zeros((0, self.model_dimension), dtype=np.float32))
+        self.cache = np.zeros(
+            (self.model_layers, 2, self.context_window, self.model_dimension),
+            dtype=np.float32,
+        )
         self.cache_len = 0
 
     # provide a list of token ids to run inference against
@@ -81,13 +79,16 @@ class Inference:
 
         probabilities = self.softmax(logits, self.temperature)
 
+        next_id = self.sample(probabilities)
+        return next_id
+
+    def sample(self, probabilities: ndarray, top_k: int = 10) -> int:
         # sampling
-        top_ids = np.argsort(probabilities)[-10:][::-1]  # 10 highest, descending
+        top_ids = np.argpartition(probabilities, -top_k)[-top_k:]
+        top_ids = top_ids[np.argsort(probabilities[top_ids])[::-1]]
         top_probabilities = probabilities[top_ids]
         top_probabilities = top_probabilities / top_probabilities.sum()
-        next_id = int(np.random.choice(top_ids, p=top_probabilities))
-
-        return next_id
+        return int(np.random.choice(top_ids, p=top_probabilities))
 
     # do all of the work to compute a single layer (attention/MLP)
     def compute_layer(self, layer: int, start: int):
@@ -107,14 +108,18 @@ class Inference:
         # QKV comes as a combined vector. In GPT2 this means 12 heads with 64 values for each Q,K, and V (2304 total)
         qkv = np.dot(normalized_stream, qkv_weights) + qkv_bias
         q, k, v = np.split(qkv, 3, axis=1)
+        n = q.shape[0]
 
         # add the new values to the KV Cache so we don't have to recalculate
-        self.cache_k[layer] = np.concatenate((self.cache_k[layer], k))
-        self.cache_v[layer] = np.concatenate((self.cache_v[layer], v))
+        self.cache[layer, 0, start : start + n] = k
+        self.cache[layer, 1, start : start + n] = v
 
         # take the q,k,v vectors and compute attention
         head_outputs = self.compute_attention(
-            q, self.cache_k[layer], self.cache_v[layer], start
+            q,
+            self.cache[layer, 0, : start + n],
+            self.cache[layer, 1, : start + n],
+            start,
         )
 
         attention_projection_weights = self.w[f"h.{layer}.attn.c_proj.weight"]
