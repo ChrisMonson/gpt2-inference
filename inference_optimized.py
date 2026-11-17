@@ -104,10 +104,9 @@ class Inference:
         qkv_weights = self.w[f"h.{layer}.attn.c_attn.weight"]
         qkv_bias = self.w[f"h.{layer}.attn.c_attn.bias"]
 
-
         # QKV comes as a combined vector. In GPT2 this means 12 heads with 64 values for each Q,K, and V (2304 total)
         qkv = np.dot(normalized_stream, qkv_weights) + qkv_bias
-        q,k,v = np.split(qkv, 3, axis=1)
+        q, k, v = np.split(qkv, 3, axis=1)
 
         # add the new values to the KV Cache so we don't have to recalculate
         self.cache_k[layer] = np.concatenate((self.cache_k[layer], k))
@@ -144,33 +143,31 @@ class Inference:
     def compute_attention(
         self, q: ndarray, k: ndarray, v: ndarray, start: int
     ) -> ndarray:
-        head_size: int = int(self.model_dimension / self.model_heads)
-        outputs = np.zeros_like(q)
+        head_size: int = self.model_dimension // self.model_heads
         score_scalar = math.sqrt(head_size)
+        new_tokens = q.shape[0]
+        all_tokens = k.shape[0]
 
-        # at this point q,k,v are arrays of 768 for all tokens [tokens,768]. 768 is 64 values for each of the 12 heads
-        # split q, k, v into per-head slices
-        for i in range(self.model_heads):
-            head_start = i * head_size
-            head_q = q[:, head_start : head_start + head_size]
-            head_k = k[:, head_start : head_start + head_size]
-            head_v = v[:, head_start : head_start + head_size]
+        # reshape & transpose (n, 768) to (heads, n, head_size)
+        q = q.reshape(new_tokens, self.model_heads, head_size)
+        k = k.reshape(all_tokens, self.model_heads, head_size)
+        v = v.reshape(all_tokens, self.model_heads, head_size)
 
-            # for each new token, score the key based on the query
-            for t in range(len(head_q)):
-                pos = start + t
+        q = q.transpose(1, 0, 2)
+        k = k.transpose(1, 2, 0)
+        v = v.transpose(1, 0, 2)
 
-                scores = np.dot(head_k[:pos + 1], head_q[t]) / score_scalar
+        scores = (q @ k) / score_scalar
 
-                # softmax to scale the numbers as 0 to 1 and have them add up to 1.
-                weights = self.softmax(scores)
+        # causal mask: block keys after each query's position
+        mask = np.triu(np.ones((new_tokens, all_tokens), dtype=bool), k=start + 1)
 
-                # calculate the weighted sum by multiplying the head value vectors by the attention weights
-                weighted_sum = weights @ head_v[:pos + 1]
+        weights = self.softmax(np.where(mask, -np.inf, scores))
+        weighted_sum = weights @ v
 
-                # combine the resultant values per head back into a single vector per token
-                outputs[t, head_start : head_start + head_size] = weighted_sum
-
+        outputs = weighted_sum.transpose(1, 0, 2).reshape(
+            new_tokens, self.model_dimension
+        )
         return outputs
 
     def compute_mlp(self, layer: int) -> ndarray:
@@ -193,8 +190,8 @@ class Inference:
 
     # scale values as 0 to 1 (with temperature) and make them add up to 1
     def softmax(self, scores: ndarray, temperature: float = 1) -> ndarray:
-        exps = np.exp((scores - scores.max()) / temperature)
-        return exps / exps.sum()
+        exps = np.exp((scores - scores.max(axis=-1, keepdims=True)) / temperature)
+        return exps / exps.sum(axis=-1, keepdims=True)
 
     # Gaussian Error Linear Unit
     def gelu(self, x: ndarray) -> ndarray:
